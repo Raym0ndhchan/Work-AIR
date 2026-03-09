@@ -18,10 +18,10 @@ from typing import Any, Dict, Iterable, List, Optional
 
 
 MODE_ENDPOINTS = {
-    "aircraft_global": ["/v2/all", "/v2"],
-    "mil": ["/v2/mil"],
-    "pia": ["/v2/pia"],
-    "ladd": ["/v2/ladd"],
+    "aircraft_global": ["/v2/all", "/v2/", "/v2", "/v2/all/"],
+    "mil": ["/v2/mil", "/v2/mil/"],
+    "pia": ["/v2/pia", "/v2/pia/"],
+    "ladd": ["/v2/ladd", "/v2/ladd/"],
     "squawk": ["/v2/squawk/{value}"],
     "type": ["/v2/type/{value}"],
     "registration": ["/v2/registration/{value}"],
@@ -29,8 +29,10 @@ MODE_ENDPOINTS = {
     "callsign": ["/v2/callsign/{value}"],
     "point": ["/v2/point/{lat}/{lon}/{radius}"],
     # Backward compatibility with earlier config versions
-    "all": ["/v2/all", "/v2"],
+    "all": ["/v2/all", "/v2/", "/v2", "/v2/all/"],
 }
+
+OPENAPI_CANDIDATES = ["/openapi.json", "/docs/openapi.json", "/api/openapi.json"]
 
 CORE_FIELDS = [
     "observed_at",
@@ -91,6 +93,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Required safety switch. Collection only starts when this flag is present.",
     )
+    parser.add_argument(
+        "--list-endpoints",
+        action="store_true",
+        help="Probe OpenAPI endpoint list and exit (helps pick the right selector.endpoint_override).",
+    )
     return parser.parse_args()
 
 
@@ -136,6 +143,19 @@ def fetch_json(url: str, timeout_sec: int) -> Dict[str, Any]:
     with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
         payload = resp.read().decode("utf-8")
     return json.loads(payload)
+
+
+def discover_openapi_paths(base_url: str, timeout_sec: int) -> List[str]:
+    for suffix in OPENAPI_CANDIDATES:
+        url = f"{base_url}{suffix}"
+        try:
+            spec = fetch_json(url, timeout_sec)
+            paths = spec.get("paths")
+            if isinstance(paths, dict):
+                return sorted(paths.keys())
+        except Exception:
+            continue
+    return []
 
 
 def pick(obj: Dict[str, Any], *keys: str) -> Any:
@@ -292,9 +312,6 @@ def choose_working_url(base_url: str, endpoint_candidates: List[str], timeout_se
 
 def main() -> int:
     args = parse_args()
-    if not args.run:
-        print("No collection performed. Re-run with --run to start pulling data.")
-        return 0
 
     config_path = pathlib.Path(args.config)
     if not config_path.exists():
@@ -309,11 +326,25 @@ def main() -> int:
     schema = cfg.get("schema", {})
 
     base_url = str(source.get("base_url", "https://api.adsb.lol")).rstrip("/")
-    endpoint_candidates = build_endpoint_candidates(selector)
+    timeout_sec = int(collect.get("request_timeout_sec", 20))
 
+    if args.list_endpoints:
+        paths = discover_openapi_paths(base_url, timeout_sec)
+        if not paths:
+            print("Could not discover endpoints from OpenAPI.")
+            return 4
+        print("Discovered API paths:")
+        for path in paths:
+            print(path)
+        return 0
+
+    if not args.run:
+        print("No collection performed. Re-run with --run to start pulling data.")
+        return 0
+
+    endpoint_candidates = build_endpoint_candidates(selector)
     duration_sec = int(collect.get("duration_sec", 300))
     poll_interval_sec = max(1, int(collect.get("poll_interval_sec", 5)))
-    timeout_sec = int(collect.get("request_timeout_sec", 20))
     out_root = pathlib.Path(str(collect.get("output_dir", "data/adsb_runs")))
     save_raw = bool(collect.get("save_raw_snapshots", True))
 
@@ -328,6 +359,14 @@ def main() -> int:
         for candidate in endpoint_candidates:
             print(f"- {base_url}{candidate}")
         print(f"Failure: {format_error(exc)}")
+        discovered = discover_openapi_paths(base_url, timeout_sec)
+        if discovered:
+            print("\nDiscovered paths (from OpenAPI) you can use with selector.endpoint_override:")
+            for path in discovered:
+                if path.startswith("/v2"):
+                    print(f"- {path}")
+        else:
+            print("\nTip: run with --list-endpoints to inspect available paths from your environment.")
         return 3
 
     run_id = utc_now().strftime("%Y%m%dT%H%M%SZ")
