@@ -7,6 +7,7 @@ Runs only when explicitly invoked by the user.
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import json
 import pathlib
@@ -17,7 +18,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 
 MODE_ENDPOINTS = {
-    "all": "/v2/all",
+    "all": "/v2",  # ADSB.lol commonly serves global aircraft from /v2
     "mil": "/v2/mil",
     "pia": "/v2/pia",
     "ladd": "/v2/ladd",
@@ -101,6 +102,10 @@ def load_config(path: pathlib.Path) -> Dict[str, Any]:
 
 
 def build_endpoint(selector: Dict[str, Any]) -> str:
+    endpoint_override = selector.get("endpoint_override")
+    if endpoint_override:
+        return str(endpoint_override)
+
     mode = selector.get("mode", "all")
     if mode not in MODE_ENDPOINTS:
         raise ValueError(f"Unsupported selector.mode '{mode}'. Supported: {', '.join(sorted(MODE_ENDPOINTS))}")
@@ -223,16 +228,43 @@ def ndjson_write(path: pathlib.Path, rows: Iterable[Dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def ensure_columns(row: Dict[str, Any], profile: str, include_advanced: bool) -> Dict[str, Any]:
+def csv_write(path: pathlib.Path, rows: List[Dict[str, Any]], columns: List[str]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({col: row.get(col) for col in columns})
+
+
+def schema_columns(profile: str, include_advanced: bool) -> List[str]:
     columns = CORE_FIELDS.copy()
     if profile in {"extended", "full"}:
         columns.extend(EXTENDED_FIELDS)
     if include_advanced or profile == "full":
         columns.extend(ADVANCED_FIELDS)
+    return columns
 
-    for col in columns:
+
+def ensure_columns(row: Dict[str, Any], profile: str, include_advanced: bool) -> Dict[str, Any]:
+    for col in schema_columns(profile, include_advanced):
         row.setdefault(col, None)
     return row
+
+
+def format_error(exc: Exception) -> Dict[str, Any]:
+    if isinstance(exc, urllib.error.HTTPError):
+        body_snippet = ""
+        try:
+            body_snippet = exc.read().decode("utf-8", errors="replace")[:240]
+        except Exception:
+            body_snippet = ""
+        return {
+            "type": "HTTPError",
+            "status": exc.code,
+            "reason": str(exc.reason),
+            "body_snippet": body_snippet,
+        }
+    return {"type": exc.__class__.__name__, "message": str(exc)}
 
 
 def main() -> int:
@@ -265,6 +297,7 @@ def main() -> int:
 
     profile = str(schema.get("profile", "extended")).lower()
     include_advanced = bool(schema.get("include_null_advanced", True))
+    columns = schema_columns(profile, include_advanced)
 
     run_id = utc_now().strftime("%Y%m%dT%H%M%SZ")
     out_dir = out_root / run_id
@@ -299,12 +332,15 @@ def main() -> int:
 
             poll_index += 1
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
-            errors.append({"observed_at": observed_at, "error": str(exc)})
+            errors.append({"observed_at": observed_at, **format_error(exc)})
 
         time.sleep(poll_interval_sec)
 
+    latest_rows = list(latest_by_hex.values())
     ndjson_write(out_dir / "aircraft_events.ndjson", events)
-    ndjson_write(out_dir / "latest_aircraft.ndjson", latest_by_hex.values())
+    ndjson_write(out_dir / "latest_aircraft.ndjson", latest_rows)
+    csv_write(out_dir / "aircraft_events.csv", events, columns)
+    csv_write(out_dir / "latest_aircraft.csv", latest_rows, columns)
 
     meta = {
         "run_id": run_id,
@@ -323,6 +359,12 @@ def main() -> int:
 
     print(f"Done. Output: {out_dir}")
     print(f"Events: {len(events)} | Unique aircraft: {len(latest_by_hex)} | Errors: {len(errors)}")
+    if errors:
+        print("Sample errors:")
+        for err in errors[:3]:
+            print(f"- {err}")
+    if len(events) == 0:
+        print("No aircraft records collected. Check endpoint/mode, API availability, or adjust selector.endpoint_override.")
     return 0
 
 
