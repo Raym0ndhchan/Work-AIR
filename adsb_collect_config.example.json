@@ -1,0 +1,25 @@
+{
+  "source": {
+    "base_url": "https://api.adsb.lol"
+  },
+  "collect": {
+    "duration_sec": 300,
+    "poll_interval_sec": 5,
+    "output_dir": "data/adsb_runs",
+    "save_raw_snapshots": true,
+    "request_timeout_sec": 20
+  },
+  "selector": {
+    "mode": "all",
+    "value": null,
+    "geo": {
+      "lat": null,
+      "lon": null,
+      "radius_nm": 250
+    }
+  },
+  "schema": {
+    "profile": "extended",
+    "include_null_advanced": true
+  }
+}
