@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""Manual ADSB.lol collection runner.
+
+Runs only when explicitly invoked by the user.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import pathlib
+import time
+import urllib.error
+import urllib.request
+from typing import Any, Dict, Iterable, List, Optional
+
+
+MODE_ENDPOINTS = {
+    "all": "/v2/all",
+    "mil": "/v2/mil",
+    "pia": "/v2/pia",
+    "ladd": "/v2/ladd",
+    "squawk": "/v2/squawk/{value}",
+    "type": "/v2/type/{value}",
+    "registration": "/v2/registration/{value}",
+    "icao": "/v2/icao/{value}",
+    "callsign": "/v2/callsign/{value}",
+    "point": "/v2/point/{lat}/{lon}/{radius}",
+}
+
+CORE_FIELDS = [
+    "observed_at",
+    "source",
+    "selector_mode",
+    "icao24",
+    "callsign",
+    "lat",
+    "lon",
+    "baro_altitude_ft",
+    "ground_speed_kt",
+    "track_deg",
+    "vertical_rate_fpm",
+    "on_ground",
+]
+
+EXTENDED_FIELDS = [
+    "aircraft_category_code",
+    "aircraft_category_text",
+    "airspeed_kt",
+    "airspeed_type",
+    "surveillance_status",
+    "emergency_state",
+    "gnss_baro_alt_diff_ft",
+    "velocity_subtype",
+    "heading_deg",
+    "squawk",
+    "registration",
+    "aircraft_type",
+]
+
+ADVANCED_FIELDS = [
+    "adsb_version",
+    "nac_p",
+    "nac_v",
+    "nic",
+    "nic_supplement",
+    "sil",
+    "sil_supplement",
+    "sda",
+    "operational_modes",
+    "capability_classes",
+    "target_altitude_ft",
+    "target_heading_or_track_deg",
+    "target_is_track",
+    "vertical_mode",
+    "horizontal_mode",
+    "status_subtype",
+    "acas_ra",
+]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Collect aircraft data from ADSB.lol when manually triggered.")
+    parser.add_argument("--config", default="adsb_collect_config.json", help="Path to JSON config file")
+    parser.add_argument(
+        "--run",
+        action="store_true",
+        help="Required safety switch. Collection only starts when this flag is present.",
+    )
+    return parser.parse_args()
+
+
+def utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def load_config(path: pathlib.Path) -> Dict[str, Any]:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def build_endpoint(selector: Dict[str, Any]) -> str:
+    mode = selector.get("mode", "all")
+    if mode not in MODE_ENDPOINTS:
+        raise ValueError(f"Unsupported selector.mode '{mode}'. Supported: {', '.join(sorted(MODE_ENDPOINTS))}")
+
+    template = MODE_ENDPOINTS[mode]
+    if mode in {"squawk", "type", "registration", "icao", "callsign"}:
+        value = selector.get("value")
+        if not value:
+            raise ValueError(f"selector.value is required when mode='{mode}'")
+        return template.format(value=value)
+
+    if mode == "point":
+        geo = selector.get("geo", {})
+        lat = geo.get("lat")
+        lon = geo.get("lon")
+        radius = geo.get("radius_nm", 250)
+        if lat is None or lon is None:
+            raise ValueError("selector.geo.lat and selector.geo.lon are required when mode='point'")
+        return template.format(lat=lat, lon=lon, radius=radius)
+
+    return template
+
+
+def fetch_json(url: str, timeout_sec: int) -> Dict[str, Any]:
+    req = urllib.request.Request(url, headers={"User-Agent": "Work-AIR-collector/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+        payload = resp.read().decode("utf-8")
+    return json.loads(payload)
+
+
+def pick(obj: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in obj and obj[key] is not None:
+            return obj[key]
+    return None
+
+
+def category_text(tc: Optional[int], ca: Optional[int]) -> Optional[str]:
+    if tc is None or ca is None:
+        return None
+    mapping = {
+        (4, 1): "Light",
+        (4, 5): "Heavy",
+        (3, 6): "UAV",
+        (2, 1): "Surface emergency vehicle",
+    }
+    return mapping.get((tc, ca))
+
+
+def extract_aircraft(payload: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+    if isinstance(payload.get("aircraft"), list):
+        return payload["aircraft"]
+    if isinstance(payload.get("ac"), list):
+        return payload["ac"]
+    if isinstance(payload.get("result"), dict) and isinstance(payload["result"].get("aircraft"), list):
+        return payload["result"]["aircraft"]
+    return []
+
+
+def normalize(record: Dict[str, Any], observed_at: str, selector_mode: str, include_advanced: bool) -> Dict[str, Any]:
+    tc = pick(record, "type_code", "tc")
+    ca = pick(record, "category", "ca")
+
+    row = {
+        "observed_at": observed_at,
+        "source": "adsb.lol",
+        "selector_mode": selector_mode,
+        "icao24": pick(record, "hex", "icao24", "icao"),
+        "callsign": (pick(record, "flight", "callsign") or "").strip() or None,
+        "lat": pick(record, "lat"),
+        "lon": pick(record, "lon"),
+        "baro_altitude_ft": pick(record, "alt_baro", "baro_altitude", "altitude"),
+        "ground_speed_kt": pick(record, "gs", "ground_speed", "speed"),
+        "track_deg": pick(record, "track", "trk"),
+        "vertical_rate_fpm": pick(record, "baro_rate", "vert_rate", "vertical_rate"),
+        "on_ground": pick(record, "ground", "on_ground"),
+        "aircraft_category_code": ca,
+        "aircraft_category_text": category_text(tc, ca),
+        "airspeed_kt": pick(record, "ias", "tas", "airspeed"),
+        "airspeed_type": "IAS" if pick(record, "ias") is not None else ("TAS" if pick(record, "tas") is not None else None),
+        "surveillance_status": pick(record, "surveillance_status", "ss"),
+        "emergency_state": pick(record, "emergency", "emergency_state"),
+        "gnss_baro_alt_diff_ft": pick(record, "geom_minus_baro", "gnss_baro_alt_diff_ft"),
+        "velocity_subtype": pick(record, "velocity_subtype"),
+        "heading_deg": pick(record, "heading", "hdg"),
+        "squawk": pick(record, "squawk"),
+        "registration": pick(record, "r", "reg", "registration"),
+        "aircraft_type": pick(record, "t", "type", "aircraft_type"),
+    }
+
+    if include_advanced:
+        row.update(
+            {
+                "adsb_version": pick(record, "version", "adsb_version"),
+                "nac_p": pick(record, "nac_p"),
+                "nac_v": pick(record, "nac_v"),
+                "nic": pick(record, "nic"),
+                "nic_supplement": pick(record, "nic_supplement", "nic_s"),
+                "sil": pick(record, "sil"),
+                "sil_supplement": pick(record, "sil_supplement"),
+                "sda": pick(record, "sda"),
+                "operational_modes": pick(record, "operational_modes", "op_modes"),
+                "capability_classes": pick(record, "capability_classes"),
+                "target_altitude_ft": pick(record, "selected_altitude", "target_altitude_ft"),
+                "target_heading_or_track_deg": pick(record, "target_heading", "target_track", "target_heading_or_track_deg"),
+                "target_is_track": pick(record, "target_is_track"),
+                "vertical_mode": pick(record, "vertical_mode"),
+                "horizontal_mode": pick(record, "horizontal_mode"),
+                "status_subtype": pick(record, "status_subtype"),
+                "acas_ra": pick(record, "acas_ra", "ra_active"),
+            }
+        )
+
+    return row
+
+
+def ndjson_write(path: pathlib.Path, rows: Iterable[Dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def ensure_columns(row: Dict[str, Any], profile: str, include_advanced: bool) -> Dict[str, Any]:
+    columns = CORE_FIELDS.copy()
+    if profile in {"extended", "full"}:
+        columns.extend(EXTENDED_FIELDS)
+    if include_advanced or profile == "full":
+        columns.extend(ADVANCED_FIELDS)
+
+    for col in columns:
+        row.setdefault(col, None)
+    return row
+
+
+def main() -> int:
+    args = parse_args()
+    if not args.run:
+        print("No collection performed. Re-run with --run to start pulling data.")
+        return 0
+
+    config_path = pathlib.Path(args.config)
+    if not config_path.exists():
+        print(f"Config not found: {config_path}")
+        print("Copy adsb_collect_config.example.json to adsb_collect_config.json and edit values.")
+        return 2
+
+    cfg = load_config(config_path)
+    source = cfg.get("source", {})
+    collect = cfg.get("collect", {})
+    selector = cfg.get("selector", {})
+    schema = cfg.get("schema", {})
+
+    base_url = str(source.get("base_url", "https://api.adsb.lol")).rstrip("/")
+    endpoint = build_endpoint(selector)
+    url = f"{base_url}{endpoint}"
+
+    duration_sec = int(collect.get("duration_sec", 300))
+    poll_interval_sec = max(1, int(collect.get("poll_interval_sec", 5)))
+    timeout_sec = int(collect.get("request_timeout_sec", 20))
+    out_root = pathlib.Path(str(collect.get("output_dir", "data/adsb_runs")))
+    save_raw = bool(collect.get("save_raw_snapshots", True))
+
+    profile = str(schema.get("profile", "extended")).lower()
+    include_advanced = bool(schema.get("include_null_advanced", True))
+
+    run_id = utc_now().strftime("%Y%m%dT%H%M%SZ")
+    out_dir = out_root / run_id
+    raw_dir = out_dir / "raw_snapshots"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if save_raw:
+        raw_dir.mkdir(parents=True, exist_ok=True)
+
+    end_time = time.time() + duration_sec
+    poll_index = 0
+    errors: List[Dict[str, Any]] = []
+    events: List[Dict[str, Any]] = []
+    latest_by_hex: Dict[str, Dict[str, Any]] = {}
+
+    print(f"Starting collection for {duration_sec}s from {url}")
+    while time.time() < end_time:
+        observed_at = utc_now().isoformat()
+        try:
+            payload = fetch_json(url, timeout_sec)
+            if save_raw:
+                snapshot_path = raw_dir / f"snapshot_{poll_index:04d}.json"
+                snapshot_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+            for ac in extract_aircraft(payload):
+                row = normalize(ac, observed_at, selector.get("mode", "all"), include_advanced)
+                row = ensure_columns(row, profile, include_advanced)
+                icao24 = row.get("icao24")
+                if not icao24:
+                    continue
+                events.append(row)
+                latest_by_hex[str(icao24)] = row
+
+            poll_index += 1
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
+            errors.append({"observed_at": observed_at, "error": str(exc)})
+
+        time.sleep(poll_interval_sec)
+
+    ndjson_write(out_dir / "aircraft_events.ndjson", events)
+    ndjson_write(out_dir / "latest_aircraft.ndjson", latest_by_hex.values())
+
+    meta = {
+        "run_id": run_id,
+        "source": "adsb.lol",
+        "url": url,
+        "duration_sec": duration_sec,
+        "poll_interval_sec": poll_interval_sec,
+        "polls_completed": poll_index,
+        "events_count": len(events),
+        "unique_aircraft": len(latest_by_hex),
+        "selector": selector,
+        "schema": schema,
+        "errors": errors,
+    }
+    (out_dir / "run_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    print(f"Done. Output: {out_dir}")
+    print(f"Events: {len(events)} | Unique aircraft: {len(latest_by_hex)} | Errors: {len(errors)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
