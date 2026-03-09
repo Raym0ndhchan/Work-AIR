@@ -4,10 +4,17 @@ Manual, config-driven ADSB.lol aircraft collection for fixed windows (default: 5
 
 ## What this does
 
+<<<<<<< codex/plan-data-collection-for-adb-s-ixv1pd
+- Collects **aircraft-only** data from ADSB.lol (no airport endpoints).
+- Default mode is `aircraft_global_grid`, which uses many `/v2/point/...` aircraft queries to approximate global coverage.
+- Runs only when explicitly requested (`--run`).
+- Writes NDJSON + CSV outputs.
+=======
 - Collects **aircraft-only** data from ADSB.lol (no airport endpoints are used).
 - Supports filters via config (`aircraft_global`, `mil`, `pia`, `ladd`, `type`, `squawk`, etc.).
 - Runs **only when explicitly requested** (`--run` flag).
 - Writes run outputs to timestamped folders in both **NDJSON and CSV**.
+>>>>>>> main
 
 ## Run in GitHub Codespaces (copy/paste)
 
@@ -17,6 +24,40 @@ cp adsb_collect_config.example.json adsb_collect_config.json
 python3 collect_adsb.py --config adsb_collect_config.json --run
 ```
 
+<<<<<<< codex/plan-data-collection-for-adb-s-ixv1pd
+## Why your previous run failed
+
+Your environment discovered v2 endpoints like `/v2/mil`, `/v2/pia`, `/v2/point/...`, but **not** a global `/v2/all` endpoint.
+So this collector now defaults to `aircraft_global_grid` (point-based global sampling), which avoids needing `/v2/all`.
+
+## Selector modes
+
+- `aircraft_global_grid` (default, recommended)
+- `mil`
+- `pia`
+- `ladd`
+- `squawk`
+- `type`
+- `registration`
+- `icao`
+- `callsign`
+- `point`
+
+## Optional: custom global grid points
+
+Set `selector.global_points` to custom `[lat, lon]` points if you want denser or regional coverage.
+
+Example:
+
+```json
+"selector": {
+  "mode": "aircraft_global_grid",
+  "global_points": [[40, -75], [52, 13], [35, 139]]
+}
+```
+
+## Output
+=======
 ## If global endpoint fails (404), auto-diagnose
 
 ```bash
@@ -61,10 +102,14 @@ For `aircraft_global`, the collector tries these endpoints in order:
 ## Output layout
 
 Each run creates:
+>>>>>>> main
 
 - `data/adsb_runs/<run_id>/aircraft_events.ndjson`
 - `data/adsb_runs/<run_id>/latest_aircraft.ndjson`
 - `data/adsb_runs/<run_id>/aircraft_events.csv`
 - `data/adsb_runs/<run_id>/latest_aircraft.csv`
 - `data/adsb_runs/<run_id>/run_meta.json`
+<<<<<<< codex/plan-data-collection-for-adb-s-ixv1pd
+=======
 - `data/adsb_runs/<run_id>/raw_snapshots/*.json` (if enabled)
+>>>>>>> main

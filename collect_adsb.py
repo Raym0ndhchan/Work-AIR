@@ -14,25 +14,54 @@ import pathlib
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 MODE_ENDPOINTS = {
-    "aircraft_global": ["/v2/all", "/v2/", "/v2", "/v2/all/"],
+    # New default: emulate global by polling multiple point queries.
+    "aircraft_global_grid": [],
     "mil": ["/v2/mil", "/v2/mil/"],
     "pia": ["/v2/pia", "/v2/pia/"],
     "ladd": ["/v2/ladd", "/v2/ladd/"],
-    "squawk": ["/v2/squawk/{value}"],
+    "squawk": ["/v2/squawk/{value}", "/v2/sqk/{value}"],
     "type": ["/v2/type/{value}"],
-    "registration": ["/v2/registration/{value}"],
-    "icao": ["/v2/icao/{value}"],
+    "registration": ["/v2/registration/{value}", "/v2/reg/{value}"],
+    "icao": ["/v2/icao/{value}", "/v2/hex/{value}"],
     "callsign": ["/v2/callsign/{value}"],
-    "point": ["/v2/point/{lat}/{lon}/{radius}"],
+    "point": ["/v2/point/{lat}/{lon}/{radius}", "/v2/lat/{lat}/lon/{lon}/dist/{radius}"],
     # Backward compatibility with earlier config versions
-    "all": ["/v2/all", "/v2/", "/v2", "/v2/all/"],
+    "aircraft_global": [],
+    "all": [],
 }
 
 OPENAPI_CANDIDATES = ["/openapi.json", "/docs/openapi.json", "/api/openapi.json"]
+
+DEFAULT_GLOBAL_GRID = [
+    (-60.0, -150.0),
+    (-60.0, -90.0),
+    (-60.0, -30.0),
+    (-60.0, 30.0),
+    (-60.0, 90.0),
+    (-60.0, 150.0),
+    (-20.0, -150.0),
+    (-20.0, -90.0),
+    (-20.0, -30.0),
+    (-20.0, 30.0),
+    (-20.0, 90.0),
+    (-20.0, 150.0),
+    (20.0, -150.0),
+    (20.0, -90.0),
+    (20.0, -30.0),
+    (20.0, 30.0),
+    (20.0, 90.0),
+    (20.0, 150.0),
+    (60.0, -150.0),
+    (60.0, -90.0),
+    (60.0, -30.0),
+    (60.0, 30.0),
+    (60.0, 90.0),
+    (60.0, 150.0),
+]
 
 CORE_FIELDS = [
     "observed_at",
@@ -88,16 +117,8 @@ ADVANCED_FIELDS = [
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Collect aircraft data from ADSB.lol when manually triggered.")
     parser.add_argument("--config", default="adsb_collect_config.json", help="Path to JSON config file")
-    parser.add_argument(
-        "--run",
-        action="store_true",
-        help="Required safety switch. Collection only starts when this flag is present.",
-    )
-    parser.add_argument(
-        "--list-endpoints",
-        action="store_true",
-        help="Probe OpenAPI endpoint list and exit (helps pick the right selector.endpoint_override).",
-    )
+    parser.add_argument("--run", action="store_true", help="Required safety switch. Collection only starts when this flag is present.")
+    parser.add_argument("--list-endpoints", action="store_true", help="Probe OpenAPI endpoint list and exit.")
     return parser.parse_args()
 
 
@@ -108,34 +129,6 @@ def utc_now() -> dt.datetime:
 def load_config(path: pathlib.Path) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
-
-
-def build_endpoint_candidates(selector: Dict[str, Any]) -> List[str]:
-    endpoint_override = selector.get("endpoint_override")
-    if endpoint_override:
-        return [str(endpoint_override)]
-
-    mode = selector.get("mode", "aircraft_global")
-    if mode not in MODE_ENDPOINTS:
-        raise ValueError(f"Unsupported selector.mode '{mode}'. Supported: {', '.join(sorted(MODE_ENDPOINTS))}")
-
-    templates = MODE_ENDPOINTS[mode]
-    if mode in {"squawk", "type", "registration", "icao", "callsign"}:
-        value = selector.get("value")
-        if not value:
-            raise ValueError(f"selector.value is required when mode='{mode}'")
-        return [template.format(value=value) for template in templates]
-
-    if mode == "point":
-        geo = selector.get("geo", {})
-        lat = geo.get("lat")
-        lon = geo.get("lon")
-        radius = geo.get("radius_nm", 250)
-        if lat is None or lon is None:
-            raise ValueError("selector.geo.lat and selector.geo.lon are required when mode='point'")
-        return [template.format(lat=lat, lon=lon, radius=radius) for template in templates]
-
-    return templates
 
 
 def fetch_json(url: str, timeout_sec: int) -> Dict[str, Any]:
@@ -158,6 +151,51 @@ def discover_openapi_paths(base_url: str, timeout_sec: int) -> List[str]:
     return []
 
 
+def build_endpoint_candidates(selector: Dict[str, Any]) -> List[str]:
+    endpoint_override = selector.get("endpoint_override")
+    if endpoint_override:
+        return [str(endpoint_override)]
+
+    mode = selector.get("mode", "aircraft_global_grid")
+    if mode not in MODE_ENDPOINTS:
+        raise ValueError(f"Unsupported selector.mode '{mode}'. Supported: {', '.join(sorted(MODE_ENDPOINTS))}")
+
+    templates = MODE_ENDPOINTS[mode]
+    if mode in {"squawk", "type", "registration", "icao", "callsign"}:
+        value = selector.get("value")
+        if not value:
+            raise ValueError(f"selector.value is required when mode='{mode}'")
+        return [template.format(value=value) for template in templates]
+
+    if mode == "point":
+        geo = selector.get("geo", {})
+        lat = geo.get("lat")
+        lon = geo.get("lon")
+        radius = geo.get("radius_nm", 250)
+        if lat is None or lon is None:
+            raise ValueError("selector.geo.lat and selector.geo.lon are required when mode='point'")
+        return [template.format(lat=lat, lon=lon, radius=radius) for template in templates]
+
+    return templates
+
+
+def build_grid_urls(base_url: str, selector: Dict[str, Any]) -> List[str]:
+    geo = selector.get("geo", {})
+    radius = geo.get("radius_nm", 250)
+
+    points = selector.get("global_points")
+    if not isinstance(points, list) or len(points) == 0:
+        points = [[lat, lon] for lat, lon in DEFAULT_GLOBAL_GRID]
+
+    urls: List[str] = []
+    for point in points:
+        if not isinstance(point, (list, tuple)) or len(point) != 2:
+            continue
+        lat, lon = point
+        urls.append(f"{base_url}/v2/point/{lat}/{lon}/{radius}")
+    return urls
+
+
 def pick(obj: Dict[str, Any], *keys: str) -> Any:
     for key in keys:
         if key in obj and obj[key] is not None:
@@ -168,12 +206,7 @@ def pick(obj: Dict[str, Any], *keys: str) -> Any:
 def category_text(tc: Optional[int], ca: Optional[int]) -> Optional[str]:
     if tc is None or ca is None:
         return None
-    mapping = {
-        (4, 1): "Light",
-        (4, 5): "Heavy",
-        (3, 6): "UAV",
-        (2, 1): "Surface emergency vehicle",
-    }
+    mapping = {(4, 1): "Light", (4, 5): "Heavy", (3, 6): "UAV", (2, 1): "Surface emergency vehicle"}
     return mapping.get((tc, ca))
 
 
@@ -219,27 +252,25 @@ def normalize(record: Dict[str, Any], observed_at: str, selector_mode: str, incl
     }
 
     if include_advanced:
-        row.update(
-            {
-                "adsb_version": pick(record, "version", "adsb_version"),
-                "nac_p": pick(record, "nac_p"),
-                "nac_v": pick(record, "nac_v"),
-                "nic": pick(record, "nic"),
-                "nic_supplement": pick(record, "nic_supplement", "nic_s"),
-                "sil": pick(record, "sil"),
-                "sil_supplement": pick(record, "sil_supplement"),
-                "sda": pick(record, "sda"),
-                "operational_modes": pick(record, "operational_modes", "op_modes"),
-                "capability_classes": pick(record, "capability_classes"),
-                "target_altitude_ft": pick(record, "selected_altitude", "target_altitude_ft"),
-                "target_heading_or_track_deg": pick(record, "target_heading", "target_track", "target_heading_or_track_deg"),
-                "target_is_track": pick(record, "target_is_track"),
-                "vertical_mode": pick(record, "vertical_mode"),
-                "horizontal_mode": pick(record, "horizontal_mode"),
-                "status_subtype": pick(record, "status_subtype"),
-                "acas_ra": pick(record, "acas_ra", "ra_active"),
-            }
-        )
+        row.update({
+            "adsb_version": pick(record, "version", "adsb_version"),
+            "nac_p": pick(record, "nac_p"),
+            "nac_v": pick(record, "nac_v"),
+            "nic": pick(record, "nic"),
+            "nic_supplement": pick(record, "nic_supplement", "nic_s"),
+            "sil": pick(record, "sil"),
+            "sil_supplement": pick(record, "sil_supplement"),
+            "sda": pick(record, "sda"),
+            "operational_modes": pick(record, "operational_modes", "op_modes"),
+            "capability_classes": pick(record, "capability_classes"),
+            "target_altitude_ft": pick(record, "selected_altitude", "target_altitude_ft"),
+            "target_heading_or_track_deg": pick(record, "target_heading", "target_track", "target_heading_or_track_deg"),
+            "target_is_track": pick(record, "target_is_track"),
+            "vertical_mode": pick(record, "vertical_mode"),
+            "horizontal_mode": pick(record, "horizontal_mode"),
+            "status_subtype": pick(record, "status_subtype"),
+            "acas_ra": pick(record, "acas_ra", "ra_active"),
+        })
 
     return row
 
@@ -280,12 +311,7 @@ def format_error(exc: Exception) -> Dict[str, Any]:
             body_snippet = exc.read().decode("utf-8", errors="replace")[:240]
         except Exception:
             body_snippet = ""
-        return {
-            "type": "HTTPError",
-            "status": exc.code,
-            "reason": str(exc.reason),
-            "body_snippet": body_snippet,
-        }
+        return {"type": "HTTPError", "status": exc.code, "reason": str(exc.reason), "body_snippet": body_snippet}
     return {"type": exc.__class__.__name__, "message": str(exc)}
 
 
@@ -342,7 +368,8 @@ def main() -> int:
         print("No collection performed. Re-run with --run to start pulling data.")
         return 0
 
-    endpoint_candidates = build_endpoint_candidates(selector)
+    mode = selector.get("mode", "aircraft_global_grid")
+
     duration_sec = int(collect.get("duration_sec", 300))
     poll_interval_sec = max(1, int(collect.get("poll_interval_sec", 5)))
     out_root = pathlib.Path(str(collect.get("output_dir", "data/adsb_runs")))
@@ -352,22 +379,33 @@ def main() -> int:
     include_advanced = bool(schema.get("include_null_advanced", True))
     columns = schema_columns(profile, include_advanced)
 
-    try:
-        url = choose_working_url(base_url, endpoint_candidates, timeout_sec)
-    except Exception as exc:
-        print("Unable to resolve a working ADSB endpoint from candidates:")
-        for candidate in endpoint_candidates:
-            print(f"- {base_url}{candidate}")
-        print(f"Failure: {format_error(exc)}")
-        discovered = discover_openapi_paths(base_url, timeout_sec)
-        if discovered:
-            print("\nDiscovered paths (from OpenAPI) you can use with selector.endpoint_override:")
-            for path in discovered:
-                if path.startswith("/v2"):
-                    print(f"- {path}")
-        else:
-            print("\nTip: run with --list-endpoints to inspect available paths from your environment.")
-        return 3
+    grid_urls: List[str] = []
+    single_url: Optional[str] = None
+
+    if mode in {"aircraft_global_grid", "aircraft_global", "all"} and not selector.get("endpoint_override"):
+        grid_urls = build_grid_urls(base_url, selector)
+        if not grid_urls:
+            print("No grid URLs were generated for global mode. Check selector.global_points.")
+            return 3
+        print(f"Using aircraft global grid mode with {len(grid_urls)} point queries per poll.")
+    else:
+        endpoint_candidates = build_endpoint_candidates(selector)
+        try:
+            single_url = choose_working_url(base_url, endpoint_candidates, timeout_sec)
+        except Exception as exc:
+            print("Unable to resolve a working ADSB endpoint from candidates:")
+            for candidate in endpoint_candidates:
+                print(f"- {base_url}{candidate}")
+            print(f"Failure: {format_error(exc)}")
+            discovered = discover_openapi_paths(base_url, timeout_sec)
+            if discovered:
+                print("\nDiscovered paths (from OpenAPI) you can use with selector.endpoint_override:")
+                for path in discovered:
+                    if path.startswith("/v2"):
+                        print(f"- {path}")
+            else:
+                print("\nTip: run with --list-endpoints to inspect available paths from your environment.")
+            return 3
 
     run_id = utc_now().strftime("%Y%m%dT%H%M%SZ")
     out_dir = out_root / run_id
@@ -382,28 +420,35 @@ def main() -> int:
     events: List[Dict[str, Any]] = []
     latest_by_hex: Dict[str, Dict[str, Any]] = {}
 
-    print(f"Starting collection for {duration_sec}s from {url}")
+    start_msg = single_url if single_url else f"grid:{len(grid_urls)} endpoints"
+    print(f"Starting collection for {duration_sec}s from {start_msg}")
+
     while time.time() < end_time:
         observed_at = utc_now().isoformat()
-        try:
-            payload = fetch_json(url, timeout_sec)
-            if save_raw:
-                snapshot_path = raw_dir / f"snapshot_{poll_index:04d}.json"
-                snapshot_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        urls_to_poll = [single_url] if single_url else grid_urls
 
-            for ac in extract_aircraft(payload):
-                row = normalize(ac, observed_at, selector.get("mode", "aircraft_global"), include_advanced)
-                row = ensure_columns(row, profile, include_advanced)
-                icao24 = row.get("icao24")
-                if not icao24:
-                    continue
-                events.append(row)
-                latest_by_hex[str(icao24)] = row
+        for url in urls_to_poll:
+            if url is None:
+                continue
+            try:
+                payload = fetch_json(url, timeout_sec)
+                if save_raw:
+                    safe_name = url.replace("https://", "").replace("/", "_").replace("{", "").replace("}", "")
+                    snapshot_path = raw_dir / f"snapshot_{poll_index:04d}_{safe_name}.json"
+                    snapshot_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
-            poll_index += 1
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
-            errors.append({"observed_at": observed_at, **format_error(exc)})
+                for ac in extract_aircraft(payload):
+                    row = normalize(ac, observed_at, mode, include_advanced)
+                    row = ensure_columns(row, profile, include_advanced)
+                    icao24 = row.get("icao24")
+                    if not icao24:
+                        continue
+                    events.append(row)
+                    latest_by_hex[str(icao24)] = row
+            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
+                errors.append({"observed_at": observed_at, "url": url, **format_error(exc)})
 
+        poll_index += 1
         time.sleep(poll_interval_sec)
 
     latest_rows = list(latest_by_hex.values())
@@ -415,8 +460,8 @@ def main() -> int:
     meta = {
         "run_id": run_id,
         "source": "adsb.lol",
-        "url": url,
-        "endpoint_candidates": endpoint_candidates,
+        "url": single_url,
+        "grid_urls_count": len(grid_urls),
         "duration_sec": duration_sec,
         "poll_interval_sec": poll_interval_sec,
         "polls_completed": poll_index,
@@ -435,7 +480,7 @@ def main() -> int:
         for err in errors[:3]:
             print(f"- {err}")
     if len(events) == 0:
-        print("No aircraft records collected. Check endpoint/mode, API availability, or adjust selector.endpoint_override.")
+        print("No aircraft records collected. Check API availability or set selector.endpoint_override.")
     return 0
 
 

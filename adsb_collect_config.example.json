@@ -10,14 +10,15 @@
     "request_timeout_sec": 20
   },
   "selector": {
-    "mode": "aircraft_global",
+    "mode": "aircraft_global_grid",
     "endpoint_override": null,
     "value": null,
     "geo": {
       "lat": null,
       "lon": null,
       "radius_nm": 250
-    }
+    },
+    "global_points": []
   },
   "schema": {
     "profile": "extended",
