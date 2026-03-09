@@ -18,16 +18,18 @@ from typing import Any, Dict, Iterable, List, Optional
 
 
 MODE_ENDPOINTS = {
-    "all": "/v2",  # ADSB.lol commonly serves global aircraft from /v2
-    "mil": "/v2/mil",
-    "pia": "/v2/pia",
-    "ladd": "/v2/ladd",
-    "squawk": "/v2/squawk/{value}",
-    "type": "/v2/type/{value}",
-    "registration": "/v2/registration/{value}",
-    "icao": "/v2/icao/{value}",
-    "callsign": "/v2/callsign/{value}",
-    "point": "/v2/point/{lat}/{lon}/{radius}",
+    "aircraft_global": ["/v2/all", "/v2"],
+    "mil": ["/v2/mil"],
+    "pia": ["/v2/pia"],
+    "ladd": ["/v2/ladd"],
+    "squawk": ["/v2/squawk/{value}"],
+    "type": ["/v2/type/{value}"],
+    "registration": ["/v2/registration/{value}"],
+    "icao": ["/v2/icao/{value}"],
+    "callsign": ["/v2/callsign/{value}"],
+    "point": ["/v2/point/{lat}/{lon}/{radius}"],
+    # Backward compatibility with earlier config versions
+    "all": ["/v2/all", "/v2"],
 }
 
 CORE_FIELDS = [
@@ -101,21 +103,21 @@ def load_config(path: pathlib.Path) -> Dict[str, Any]:
         return json.load(f)
 
 
-def build_endpoint(selector: Dict[str, Any]) -> str:
+def build_endpoint_candidates(selector: Dict[str, Any]) -> List[str]:
     endpoint_override = selector.get("endpoint_override")
     if endpoint_override:
-        return str(endpoint_override)
+        return [str(endpoint_override)]
 
-    mode = selector.get("mode", "all")
+    mode = selector.get("mode", "aircraft_global")
     if mode not in MODE_ENDPOINTS:
         raise ValueError(f"Unsupported selector.mode '{mode}'. Supported: {', '.join(sorted(MODE_ENDPOINTS))}")
 
-    template = MODE_ENDPOINTS[mode]
+    templates = MODE_ENDPOINTS[mode]
     if mode in {"squawk", "type", "registration", "icao", "callsign"}:
         value = selector.get("value")
         if not value:
             raise ValueError(f"selector.value is required when mode='{mode}'")
-        return template.format(value=value)
+        return [template.format(value=value) for template in templates]
 
     if mode == "point":
         geo = selector.get("geo", {})
@@ -124,9 +126,9 @@ def build_endpoint(selector: Dict[str, Any]) -> str:
         radius = geo.get("radius_nm", 250)
         if lat is None or lon is None:
             raise ValueError("selector.geo.lat and selector.geo.lon are required when mode='point'")
-        return template.format(lat=lat, lon=lon, radius=radius)
+        return [template.format(lat=lat, lon=lon, radius=radius) for template in templates]
 
-    return template
+    return templates
 
 
 def fetch_json(url: str, timeout_sec: int) -> Dict[str, Any]:
@@ -267,6 +269,27 @@ def format_error(exc: Exception) -> Dict[str, Any]:
     return {"type": exc.__class__.__name__, "message": str(exc)}
 
 
+def choose_working_url(base_url: str, endpoint_candidates: List[str], timeout_sec: int) -> str:
+    last_error: Optional[Exception] = None
+    for endpoint in endpoint_candidates:
+        url = f"{base_url}{endpoint}"
+        try:
+            fetch_json(url, timeout_sec)
+            return url
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code == 404:
+                continue
+            raise
+        except Exception as exc:
+            last_error = exc
+            raise
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("No endpoint candidates were provided")
+
+
 def main() -> int:
     args = parse_args()
     if not args.run:
@@ -286,8 +309,7 @@ def main() -> int:
     schema = cfg.get("schema", {})
 
     base_url = str(source.get("base_url", "https://api.adsb.lol")).rstrip("/")
-    endpoint = build_endpoint(selector)
-    url = f"{base_url}{endpoint}"
+    endpoint_candidates = build_endpoint_candidates(selector)
 
     duration_sec = int(collect.get("duration_sec", 300))
     poll_interval_sec = max(1, int(collect.get("poll_interval_sec", 5)))
@@ -298,6 +320,15 @@ def main() -> int:
     profile = str(schema.get("profile", "extended")).lower()
     include_advanced = bool(schema.get("include_null_advanced", True))
     columns = schema_columns(profile, include_advanced)
+
+    try:
+        url = choose_working_url(base_url, endpoint_candidates, timeout_sec)
+    except Exception as exc:
+        print("Unable to resolve a working ADSB endpoint from candidates:")
+        for candidate in endpoint_candidates:
+            print(f"- {base_url}{candidate}")
+        print(f"Failure: {format_error(exc)}")
+        return 3
 
     run_id = utc_now().strftime("%Y%m%dT%H%M%SZ")
     out_dir = out_root / run_id
@@ -322,7 +353,7 @@ def main() -> int:
                 snapshot_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
             for ac in extract_aircraft(payload):
-                row = normalize(ac, observed_at, selector.get("mode", "all"), include_advanced)
+                row = normalize(ac, observed_at, selector.get("mode", "aircraft_global"), include_advanced)
                 row = ensure_columns(row, profile, include_advanced)
                 icao24 = row.get("icao24")
                 if not icao24:
@@ -346,6 +377,7 @@ def main() -> int:
         "run_id": run_id,
         "source": "adsb.lol",
         "url": url,
+        "endpoint_candidates": endpoint_candidates,
         "duration_sec": duration_sec,
         "poll_interval_sec": poll_interval_sec,
         "polls_completed": poll_index,

@@ -10,7 +10,7 @@
     "request_timeout_sec": 20
   },
   "selector": {
-    "mode": "all",
+    "mode": "aircraft_global",
     "endpoint_override": null,
     "value": null,
     "geo": {
