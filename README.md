@@ -8,6 +8,7 @@ Manual, config-driven ADSB.lol aircraft collection for fixed windows (default: 5
 - Default mode is `aircraft_global_grid`, which uses many `/v2/point/...` aircraft queries to approximate global coverage.
 - Runs only when explicitly requested (`--run`).
 - Writes NDJSON + CSV outputs.
+main
 
 ## Run in GitHub Codespaces (copy/paste)
 
@@ -49,9 +50,11 @@ Example:
 ```
 
 ## Output
+main
 
 - `data/adsb_runs/<run_id>/aircraft_events.ndjson`
 - `data/adsb_runs/<run_id>/latest_aircraft.ndjson`
 - `data/adsb_runs/<run_id>/aircraft_events.csv`
 - `data/adsb_runs/<run_id>/latest_aircraft.csv`
 - `data/adsb_runs/<run_id>/run_meta.json`
+main
